@@ -1,0 +1,1 @@
+timestamp,signal_id,symbol,direction,qty,entry_price,take_profit,stop_loss,leverage,status,response_code,latency_ms,error_msg,validation_errors,thread_id
