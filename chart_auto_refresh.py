@@ -376,8 +376,29 @@ def read_chart_state(
     symbol: Optional[str] = None,
     timeframe: Optional[str] = None,
 ) -> Tuple[Optional[pd.DataFrame], Dict[str, Any], int]:
-    """Safely read chart DataFrame and indicators from session state."""
+    """Safely read chart DataFrame and indicators from session state.
+    
+    Checks both ChartDataStore (for WebSocket updates) and direct session_state
+    (for REST polling updates) to ensure data is always available.
+    """
     with _CHART_DATA_LOCK:
+        # First, try to read from ChartDataStore (used by WebSocket updates)
+        store = getattr(session_state, STORE_STATE_KEY, None)
+        if isinstance(store, ChartDataStore):
+            # Sync show_forming_bar from session_state to ChartDataStore
+            session_show_forming = getattr(session_state, "show_forming_bar", False)
+            store.set_show_forming_bar(session_show_forming)
+            prefer_forming = store.get_show_forming_bar()
+            df_copy, indicators, last_closed_ts = store.snapshot(include_forming=prefer_forming)
+            if df_copy is not None and not df_copy.empty:
+                # Sync to session_state for backward compatibility
+                session_state.chart_df = df_copy.copy(deep=True)
+                session_state.chart_indicators = copy.deepcopy(indicators)
+                if symbol and timeframe:
+                    set_last_closed_in_state(session_state, symbol, timeframe, last_closed_ts)
+                return df_copy, indicators, last_closed_ts
+        
+        # Fallback to direct session_state (used by REST polling)
         prefer_forming = getattr(session_state, "show_forming_bar", False)
         df_source = None
         if prefer_forming:
@@ -409,6 +430,8 @@ def update_chart_state(
 ) -> None:
     """
     Safely update chart data and indicators in session state.
+    
+    Also syncs with ChartDataStore for WebSocket compatibility.
     
     Args:
         session_state: Streamlit session state
@@ -448,6 +471,10 @@ def update_chart_state(
         session_state.chart_indicators = indicators
         set_last_closed_in_state(session_state, symbol, timeframe, last_closed_close_ms)
         session_state.analysis_updated = True
+        
+        # Also sync with ChartDataStore for WebSocket compatibility
+        store = ensure_chart_store(session_state)
+        store.update_closed(combined, last_closed_close_ms, append=False)
 
 
 def get_poll_interval(timeframe: str) -> float:

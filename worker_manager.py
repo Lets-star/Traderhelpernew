@@ -210,6 +210,10 @@ class ChartWorkerManager:
                 append=True,
             )
             
+            # Set analysis_updated flag to trigger UI refresh
+            if appended > 0:
+                session_state.analysis_updated = True
+            
             logger.debug(
                 f"Applied closed kline: appended={appended}, deduped={deduped}, total={total}"
             )

@@ -2005,6 +2005,12 @@ def main():
         # Update session state tracking
         st.session_state.auto_refresh_enabled = auto_refresh
         
+        # If auto-refresh is enabled and chart_df is empty, we need to load data
+        # This handles the case when user just enables auto-refresh without changing symbol/timeframe
+        if auto_refresh and (st.session_state.chart_df is None or st.session_state.chart_df.empty):
+            symbol_changed = True  # Force data reload
+            timeframe_changed = True
+        
         # Handle symbol/timeframe change: reset state and invalidate cache
         if symbol_changed or timeframe_changed:
             st.session_state.chart_symbol = selected_token
@@ -2097,8 +2103,9 @@ def main():
             except Exception as e:
                 logger.error(f"Error polling chart worker manager: {e}", exc_info=True)
         
-        # Display chart
-        if st.session_state.chart_df is not None and not st.session_state.chart_df.empty and auto_refresh:
+        # Display chart - use realtime data if available (regardless of auto_refresh state)
+        # This ensures data loaded during auto-refresh init is displayed immediately
+        if st.session_state.chart_df is not None and not st.session_state.chart_df.empty:
             # Read chart state safely
             df, indicators, last_closed_close_ms = read_chart_state(st.session_state, selected_token, selected_timeframe)
             
@@ -3496,6 +3503,8 @@ def main():
         )
 
         normalized_weights = render_weight_controls(config_store)
+        # Always sync the current weights from config_store to state for use in signal generation
+        state["weights"] = normalized_weights
 
         with st.expander("Indicator Parameters", expanded=False):
             render_indicator_controls(config_store)
@@ -3844,7 +3853,9 @@ def main():
                 signal_data = result["explicit_signal"]
                 processed_signal = result["processed_payload"]
 
-                raw_weight_data = signal_data.get("weights") or state.get("weights")
+                # Use current weights from config_store (already synced to state["weights"])
+                # This ensures the displayed weights match the slider values
+                raw_weight_data = state.get("weights") or signal_data.get("weights")
                 normalized_weights_map, raw_weights_map = normalize_category_weights(raw_weight_data)
                 has_weight_data = any(raw_weights_map.get(category, 0.0) > 0 for category in FACTOR_CATEGORY_ORDER)
             if not has_weight_data:
