@@ -643,6 +643,7 @@ def _compute_bollinger_bands(
 def create_realtime_candlestick_chart(
     df: pd.DataFrame,
     *,
+    forming_df: Optional[pd.DataFrame] = None,
     show_bvi: bool = True,
     bvi_length: int = 8,
     atr_channels: Optional[Dict[str, Any]] = None,
@@ -705,6 +706,31 @@ def create_realtime_candlestick_chart(
         row=1,
         col=1,
     )
+
+    # ---- Forming bar (TradingView-style: semi-transparent, distinct colors) ----
+    if forming_df is not None and not forming_df.empty:
+        forming_plot = forming_df.copy().sort_values("ts").reset_index(drop=True)
+        if "timestamp" not in forming_plot.columns:
+            forming_plot["timestamp"] = pd.to_datetime(forming_plot["ts"], unit="ms", utc=True)
+        
+        fig.add_trace(
+            go.Candlestick(
+                x=forming_plot["timestamp"],
+                open=forming_plot["open"],
+                high=forming_plot["high"],
+                low=forming_plot["low"],
+                close=forming_plot["close"],
+                name="Forming",
+                increasing_line_color="#00cc88",
+                decreasing_line_color="#ff6b6b",
+                increasing_fillcolor="rgba(0, 204, 136, 0.35)",
+                decreasing_fillcolor="rgba(255, 107, 107, 0.35)",
+                opacity=0.6,
+                showlegend=True,
+            ),
+            row=1,
+            col=1,
+        )
 
     atr_color_map = {
         "atr_trend_1x": "#6366F1",
@@ -1740,7 +1766,9 @@ def main():
     if "chart_manager_started" not in st.session_state:
         st.session_state.chart_manager_started = False
     if "auto_refresh_enabled" not in st.session_state:
-        st.session_state.auto_refresh_enabled = False
+        st.session_state.auto_refresh_enabled = True  # Always enabled by default
+    if "show_forming_bar" not in st.session_state:
+        st.session_state.show_forming_bar = True  # Always show forming bar by default
     if "bvi_enabled" not in st.session_state:
         st.session_state.bvi_enabled = True
     if "atr_channels_enabled" not in st.session_state:
@@ -1927,43 +1955,33 @@ def main():
             compute_chart_indicators,
             fetch_closed_candles,
             invalidate_cache,
-            read_chart_state,
+            read_chart_state_split,
             update_chart_state,
         )
         
         st.subheader(f"Price Chart with Indicators - {selected_token}")
         
-        # Controls row
-        ctrl_col1, ctrl_col2, ctrl_col3, ctrl_col4, ctrl_col5 = st.columns([1, 1, 1, 1, 1])
+        # Constants - WebSocket and forming bar are always enabled
+        auto_refresh = True  # WebSocket always active
+        show_forming_bar = True  # Always show forming bar
+        
+        # Controls row (3 checkboxes for indicators only)
+        ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([1, 1, 1])
         with ctrl_col1:
-            auto_refresh = st.checkbox(
-                "🔄 Auto-refresh",
-                value=st.session_state.auto_refresh_enabled,
-                key="charts_auto_refresh_toggle",
-            )
-        with ctrl_col2:
-            show_forming_bar = st.checkbox(
-                "📊 Forming Bar",
-                value=st.session_state.get("show_forming_bar", False),
-                key="charts_forming_bar_toggle",
-                help="Show the currently forming candle (not yet closed)",
-            )
-            st.session_state.show_forming_bar = show_forming_bar
-        with ctrl_col3:
             bvi_enabled = st.checkbox(
                 "📊 Better Volume",
                 value=st.session_state.bvi_enabled,
                 key="charts_bvi_toggle",
             )
             st.session_state.bvi_enabled = bvi_enabled
-        with ctrl_col4:
+        with ctrl_col2:
             atr_channels_enabled = st.checkbox(
                 "📈 ATR Channels",
                 value=st.session_state.atr_channels_enabled,
                 key="charts_atr_channels_toggle",
             )
             st.session_state.atr_channels_enabled = atr_channels_enabled
-        with ctrl_col5:
+        with ctrl_col3:
             order_blocks_enabled = st.checkbox(
                 "🟦 Order Blocks",
                 value=st.session_state.order_blocks_enabled,
@@ -1971,13 +1989,15 @@ def main():
             )
             st.session_state.order_blocks_enabled = order_blocks_enabled
         
-        # Status indicator
-        if st.session_state.worker_running:
-            st.info(f"🟢 Live: Monitoring {selected_token} {selected_timeframe}")
-        elif auto_refresh:
-            st.caption("Initializing auto-refresh...")
+        # WebSocket status indicator
+        manager = st.session_state.chart_worker_manager
+        ws_connected = manager.is_websocket_connected()
+        if ws_connected:
+            st.success(f"🟢 Connected — Live: {selected_token} {selected_timeframe}")
+        elif manager.is_running():
+            st.info(f"🟡 Connecting… {selected_token} {selected_timeframe}")
         else:
-            st.caption("Auto-refresh disabled")
+            st.warning(f"🔴 Disconnected — {selected_token} {selected_timeframe}")
 
         chart_container = st.empty()
         
@@ -1985,8 +2005,8 @@ def main():
         symbol_changed = st.session_state.chart_symbol != selected_token
         timeframe_changed = st.session_state.chart_timeframe != selected_timeframe
         
-        # Stop existing worker if symbol/timeframe changed or auto-refresh disabled
-        if (symbol_changed or timeframe_changed or not auto_refresh):
+        # Stop existing worker if symbol/timeframe changed
+        if symbol_changed or timeframe_changed:
             # Stop old worker
             if st.session_state.chart_worker is not None:
                 try:
@@ -2002,12 +2022,8 @@ def main():
             except Exception as e:
                 logger.warning(f"Failed to stop chart worker manager: {e}")
         
-        # Update session state tracking
-        st.session_state.auto_refresh_enabled = auto_refresh
-        
-        # If auto-refresh is enabled and chart_df is empty, we need to load data
-        # This handles the case when user just enables auto-refresh without changing symbol/timeframe
-        if auto_refresh and (st.session_state.chart_df is None or st.session_state.chart_df.empty):
+        # If chart_df is empty, we need to load data
+        if st.session_state.chart_df is None or st.session_state.chart_df.empty:
             symbol_changed = True  # Force data reload
             timeframe_changed = True
         
@@ -2054,47 +2070,46 @@ def main():
                     st.session_state.chart_df = None
                     st.session_state.chart_indicators = None
         
-        # Start worker if auto-refresh is enabled and not already running
-        if auto_refresh:
-            use_websocket = st.session_state.use_websocket
-            manager = st.session_state.chart_worker_manager
-            
-            # Check if we need to start a new worker
-            if not manager.is_running() and st.session_state.chart_worker is None:
-                try:
-                    # Try WorkerManager with WebSocket
-                    if use_websocket:
-                        success = manager.start_new(
-                            symbol=selected_token,
-                            timeframe=selected_timeframe,
-                            update_bus=st.session_state.chart_update_bus,
-                            use_websocket=True,
-                            session_state=st.session_state,
-                            num_bars=selected_period,
-                        )
-                        if success:
-                            st.session_state.worker_running = True
-                            logger.info(f"Started WebSocket chart worker for {selected_token} {selected_timeframe}")
-                        else:
-                            # Fallback to REST polling already handled by manager
-                            st.session_state.worker_running = True
-                    else:
-                        # Use REST polling
-                        worker = ChartAutoRefreshWorker(
-                            symbol=selected_token,
-                            timeframe=selected_timeframe,
-                            num_bars=selected_period,
-                            session_state=st.session_state,
-                        )
-                        worker.start()
-                        st.session_state.chart_worker = worker
+        # Start worker (always, WebSocket is always active)
+        use_websocket = st.session_state.use_websocket
+        manager = st.session_state.chart_worker_manager
+        
+        # Check if we need to start a new worker
+        if not manager.is_running() and st.session_state.chart_worker is None:
+            try:
+                # Try WorkerManager with WebSocket
+                if use_websocket:
+                    success = manager.start_new(
+                        symbol=selected_token,
+                        timeframe=selected_timeframe,
+                        update_bus=st.session_state.chart_update_bus,
+                        use_websocket=True,
+                        session_state=st.session_state,
+                        num_bars=selected_period,
+                    )
+                    if success:
                         st.session_state.worker_running = True
-                except Exception as e:
-                    logger.error(f"Failed to start chart worker: {e}", exc_info=True)
-                    st.error(f"❌ Failed to start auto-refresh worker: {str(e)}")
+                        logger.info(f"Started WebSocket chart worker for {selected_token} {selected_timeframe}")
+                    else:
+                        # Fallback to REST polling already handled by manager
+                        st.session_state.worker_running = True
+                else:
+                    # Use REST polling
+                    worker = ChartAutoRefreshWorker(
+                        symbol=selected_token,
+                        timeframe=selected_timeframe,
+                        num_bars=selected_period,
+                        session_state=st.session_state,
+                    )
+                    worker.start()
+                    st.session_state.chart_worker = worker
+                    st.session_state.worker_running = True
+            except Exception as e:
+                logger.error(f"Failed to start chart worker: {e}", exc_info=True)
+                st.error(f"❌ Failed to start auto-refresh worker: {str(e)}")
         
         # Poll for updates from WorkerManager and apply to session state
-        if auto_refresh and st.session_state.use_websocket:
+        if st.session_state.use_websocket:
             manager = st.session_state.chart_worker_manager
             try:
                 updates_applied = manager.poll_and_apply(st.session_state)
@@ -2103,26 +2118,31 @@ def main():
             except Exception as e:
                 logger.error(f"Error polling chart worker manager: {e}", exc_info=True)
         
-        # Display chart - use realtime data if available (regardless of auto_refresh state)
-        # This ensures data loaded during auto-refresh init is displayed immediately
+        # Display chart - use realtime data with separate forming bar
         if st.session_state.chart_df is not None and not st.session_state.chart_df.empty:
-            # Read chart state safely
-            df, indicators, last_closed_close_ms = read_chart_state(st.session_state, selected_token, selected_timeframe)
+            # Read closed and forming bars separately
+            closed_df, forming_df, indicators, last_closed_close_ms = read_chart_state_split(
+                st.session_state, selected_token, selected_timeframe
+            )
             
-            if df is not None and not df.empty:
+            if closed_df is not None and not closed_df.empty:
                 # Display status with UTC timestamp
                 if last_closed_close_ms > 0:
-                    # last_closed_close_ms is the close_time of the last closed bar
                     last_closed_dt = datetime.fromtimestamp(last_closed_close_ms / 1000, tz=timezone.utc)
-                    st.caption(f"📅 Last closed bar (close time): {last_closed_dt.strftime('%Y-%m-%d %H:%M:%S')} UTC | Bars: {len(df)}")
+                    forming_status = " | 🕯️ Forming" if forming_df is not None and not forming_df.empty else ""
+                    st.caption(
+                        f"📅 Last closed bar (close time): {last_closed_dt.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+                        f" | Bars: {len(closed_df)}{forming_status}"
+                    )
                 
-                # Build realtime chart from DataFrame with indicators
+                # Build realtime chart from closed bars with forming bar overlay
                 try:
                     atr_channels_data = indicators.get("atr_channels", {}) if indicators else {}
                     order_blocks_data = indicators.get("order_blocks", []) if indicators else []
                     
                     fig = create_realtime_candlestick_chart(
-                        df,
+                        closed_df,
+                        forming_df=forming_df,
                         show_bvi=bvi_enabled,
                         atr_channels=atr_channels_data,
                         order_blocks=order_blocks_data,

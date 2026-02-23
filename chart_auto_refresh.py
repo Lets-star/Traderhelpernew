@@ -117,7 +117,8 @@ class ChartDataStore:
         combined = pd.concat(frames, ignore_index=True)
         combined = self._dedupe_sort(combined)
         self._with_forming_df = combined
-        self._with_forming_indicators = compute_chart_indicators(combined)
+        # Indicators are NOT recalculated for combined data - use closed-only indicators
+        self._with_forming_indicators = self._closed_indicators
 
     def update_closed(
         self,
@@ -217,6 +218,29 @@ class ChartDataStore:
 
             df_copy = df_source.copy(deep=True)
             return df_copy, copy.deepcopy(indicators), self._last_closed_close_ms
+
+    def snapshot_split(
+        self,
+    ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Dict[str, Any], int]:
+        """
+        Returns (closed_df, forming_df, closed_indicators, last_closed_close_ms).
+
+        Forming bar is returned separately so the caller can render it differently.
+        Indicators are always computed from closed bars only.
+        """
+        with self._lock:
+            closed_df = (
+                self._closed_df.copy(deep=True)
+                if (self._closed_df is not None and not self._closed_df.empty)
+                else None
+            )
+            forming_df = (
+                self._forming_raw_df.copy(deep=True)
+                if (self._forming_raw_df is not None and not self._forming_raw_df.empty)
+                else None
+            )
+            indicators = copy.deepcopy(self._closed_indicators) or {}
+            return closed_df, forming_df, indicators, self._last_closed_close_ms
 
     def has_closed_data(self) -> bool:
         with self._lock:
@@ -417,6 +441,43 @@ def read_chart_state(
         else:
             last_closed_ts = getattr(session_state, "last_closed_ts", 0)
     return df_copy, indicators, last_closed_ts
+
+
+def read_chart_state_split(
+    session_state: Any,
+    symbol: Optional[str] = None,
+    timeframe: Optional[str] = None,
+) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Dict[str, Any], int]:
+    """
+    Returns (closed_df, forming_df, closed_indicators, last_closed_ts).
+
+    Indicators are always from closed bars. Forming bar is separate.
+    This is the preferred function for rendering charts where forming bar
+    should be displayed distinctly from closed bars.
+    """
+    with _CHART_DATA_LOCK:
+        # First, try to read from ChartDataStore (used by WebSocket updates)
+        store = getattr(session_state, STORE_STATE_KEY, None)
+        if isinstance(store, ChartDataStore):
+            closed_df, forming_df, indicators, last_closed_ts = store.snapshot_split()
+            if closed_df is not None and not closed_df.empty:
+                # Sync to session_state for backward compatibility
+                session_state.chart_df = closed_df.copy(deep=True)
+                session_state.chart_indicators = copy.deepcopy(indicators)
+                if symbol and timeframe:
+                    set_last_closed_in_state(session_state, symbol, timeframe, last_closed_ts)
+                return closed_df, forming_df, indicators, last_closed_ts
+
+        # Fallback to direct session_state (REST polling)
+        df_source = getattr(session_state, "chart_df", None)
+        closed_df = df_source.copy(deep=True) if isinstance(df_source, pd.DataFrame) else None
+        indicators = copy.deepcopy(getattr(session_state, "chart_indicators", {}))
+        forming_df = None
+        if symbol and timeframe:
+            last_closed_ts = get_last_closed_from_state(session_state, symbol, timeframe)
+        else:
+            last_closed_ts = getattr(session_state, "last_closed_ts", 0)
+        return closed_df, forming_df, indicators, last_closed_ts
 
 
 def update_chart_state(
@@ -965,42 +1026,23 @@ class ChartAutoRefreshWorker:
                     except Exception as exc:
                         logger.error(f"Failed to update chart data: {exc}", exc_info=True)
                 
-                # Check if forming bar is enabled
-                show_forming_bar = getattr(self.session_state, "show_forming_bar", False)
-                
-                if show_forming_bar:
-                    try:
-                        forming_bar_df = fetch_forming_bar(
-                            self.symbol,
-                            self.timeframe,
-                            self.data_source,
-                        )
-                        
-                        if forming_bar_df is not None and not forming_bar_df.empty:
-                            with _CHART_DATA_LOCK:
-                                current_df = getattr(self.session_state, "chart_df", None)
-                                if current_df is not None and not current_df.empty:
-                                    closed_bars = current_df.copy(deep=True)
-                                    combined = pd.concat([closed_bars, forming_bar_df], ignore_index=True)
-                                    combined = (
-                                        combined.drop_duplicates(subset="ts", keep="last")
-                                        .sort_values("ts")
-                                        .reset_index(drop=True)
-                                    )
-                                    indicators = compute_chart_indicators(combined)
-                                    self.session_state.chart_df_with_forming = combined
-                                    self.session_state.chart_indicators = indicators
-                                    self.session_state.analysis_updated = True
-                    except Exception as exc:
-                        logger.debug(f"Failed to fetch forming bar: {exc}")
-                else:
-                    with _CHART_DATA_LOCK:
-                        if getattr(self.session_state, "chart_df_with_forming", None) is not None:
-                            self.session_state.chart_df_with_forming = None
-                            closed_df = getattr(self.session_state, "chart_df", None)
-                            if isinstance(closed_df, pd.DataFrame) and not closed_df.empty:
-                                self.session_state.chart_indicators = compute_chart_indicators(closed_df)
-                                self.session_state.analysis_updated = True
+                # Always fetch forming bar (enabled by default)
+                try:
+                    forming_bar_df = fetch_forming_bar(
+                        self.symbol,
+                        self.timeframe,
+                        self.data_source,
+                    )
+                    
+                    # Update forming bar in ChartDataStore
+                    store = ensure_chart_store(self.session_state)
+                    if forming_bar_df is not None and not forming_bar_df.empty:
+                        store.set_forming_bar(forming_bar_df)
+                        self.session_state.analysis_updated = True
+                    else:
+                        store.clear_forming_bar()
+                except Exception as exc:
+                    logger.debug(f"Failed to fetch forming bar: {exc}")
 
                 # Adaptive poll interval: sleep poll_interval seconds
                 sleep_seconds = poll_interval
