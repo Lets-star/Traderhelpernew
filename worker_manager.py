@@ -322,6 +322,13 @@ class ChartWorkerManager:
                 return getattr(self._fallback_worker, "_thread", None) is not None
             return False
 
+    def is_websocket_connected(self) -> bool:
+        """Check if WebSocket is actively connected (not just running)."""
+        with self._lock:
+            if self._ws_client is not None:
+                return self._ws_client.is_connected()
+            return False
+
 
 class SignalsWorkerManager:
     """
